@@ -1,0 +1,50 @@
+name: Build speed-limit data
+
+on:
+  schedule:
+    - cron: "17 3 2 * *"      # every month, day 2, 03:17 UTC
+  workflow_dispatch:           # "Run workflow" button
+
+permissions:
+  contents: write              # needed to publish the release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyosmium
+        run: pip install osmium
+
+      - name: Download from Geofabrik and convert
+        run: |
+          set -e
+          mkdir -p out
+          grep -v '^\s*#' countries.txt | grep -v '^\s*$' | while read -r CC PATHG; do
+            echo "::group::$CC ($PATHG)"
+            curl -fsSL --retry 3 -o src.osm.pbf "https://download.geofabrik.de/${PATHG}-latest.osm.pbf"
+            python scripts/build_speedlimits.py src.osm.pbf "$CC" "out/osm_${CC}.bin"
+            rm -f src.osm.pbf
+            echo "::endgroup::"
+          done
+          date -u +"%Y-%m-%d" > out/version.txt
+          ls -la out
+
+      - name: Publish as release "latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          NOTES="Speed-limit data built $(cat out/version.txt) from OpenStreetMap (Geofabrik extracts). Data © OpenStreetMap contributors, ODbL 1.0."
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest out/* --clobber
+            gh release edit latest --notes "$NOTES" --title "Speed limits $(cat out/version.txt)"
+          else
+            gh release create latest out/* --title "Speed limits $(cat out/version.txt)" --notes "$NOTES"
+          fi
