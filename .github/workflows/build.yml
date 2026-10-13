@@ -9,38 +9,65 @@ permissions:
   contents: write              # needed to publish the release
 
 jobs:
-  build:
+  # 1) read countries.txt -> list for the parallel jobs
+  list:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+      - id: m
+        run: |
+          M=$(grep -v '^\s*#' countries.txt | grep -v '^\s*$' | awk '{printf "%s{\"cc\":\"%s\",\"path\":\"%s\"}", (NR>1?",":""), $1, $2}')
+          echo "matrix={\"include\":[$M]}" >> "$GITHUB_OUTPUT"
 
+  # 2) one job per country, in parallel (each job may take up to 6 h; big countries need it)
+  build:
+    needs: list
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false         # one failing country doesn't stop the others
+      max-parallel: 6
+      matrix: ${{ fromJson(needs.list.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install pyosmium
-        run: pip install osmium
-
-      - name: Download from Geofabrik and convert
+      - run: pip install osmium
+      - name: Download ${{ matrix.cc }} from Geofabrik and convert
         run: |
           set -e
           mkdir -p out
-          grep -v '^\s*#' countries.txt | grep -v '^\s*$' | while read -r CC PATHG; do
-            echo "::group::$CC ($PATHG)"
-            curl -fsSL --retry 3 -o src.osm.pbf "https://download.geofabrik.de/${PATHG}-latest.osm.pbf"
-            python scripts/build_speedlimits.py src.osm.pbf "$CC" "out/osm_${CC}.bin"
-            rm -f src.osm.pbf
-            echo "::endgroup::"
-          done
-          date -u +"%Y-%m-%d" > out/version.txt
-          ls -la out
+          curl -fsSL --retry 3 -o src.osm.pbf "https://download.geofabrik.de/${{ matrix.path }}-latest.osm.pbf"
+          ls -la src.osm.pbf
+          python scripts/build_speedlimits.py src.osm.pbf "${{ matrix.cc }}" "out/osm_${{ matrix.cc }}.bin"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osm_${{ matrix.cc }}
+          path: out/osm_${{ matrix.cc }}.bin
+          retention-days: 3
 
+  # 3) publish everything that was built into the release "latest"
+  publish:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
       - name: Publish as release "latest"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
+          ls -la out
+          ls out/*.bin >/dev/null 2>&1 || { echo "nothing built"; exit 1; }
+          date -u +"%Y-%m-%d" > out/version.txt
           NOTES="Speed-limit data built $(cat out/version.txt) from OpenStreetMap (Geofabrik extracts). Data © OpenStreetMap contributors, ODbL 1.0."
           if gh release view latest >/dev/null 2>&1; then
             gh release upload latest out/* --clobber
