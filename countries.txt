@@ -1,0 +1,5 @@
+# code  geofabrik-path            (one per line; add countries here)
+RO      europe/romania
+MD      europe/moldova
+HU      europe/hungary
+BG      europe/bulgaria
