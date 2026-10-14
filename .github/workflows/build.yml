@@ -37,6 +37,8 @@ jobs:
           python-version: "3.12"
       - run: pip install osmium shapely pyproj pyogrio numpy
       - name: Download ${{ matrix.cc }} from Geofabrik and convert
+        env:
+          SIGNS_EXPORT_KEY: ${{ secrets.SIGNS_EXPORT_KEY }}    # field signs from signs.mapszone.eu
         run: |
           set -e
           mkdir -p out
