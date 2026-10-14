@@ -10,6 +10,7 @@ Output format ("OSL2", big-endian, read by OsmLimits.kt in the app):
         uint8 flags:  bit0 = inside intravilan (built-up area)
                       bit1 = JUNCTION point record (lat1==lat2, lon1==lon2, limits 0)
                       bit2 = limit derived from rules (not an explicit OSM value)
+                      bit3 = limit from a sign seen on the road (signs.mapszone.eu)
 
 Junctions = nodes where >= 3 road branches of public roads meet (not service roads,
 tracks or motorways). A speed restriction ends at the next junction.
@@ -24,6 +25,13 @@ any CRS, e.g. Stereo70 / EPSG:3844):
              other national / county / communal road 90,
              dirt roads (track / unpaved) and residential/service: no limit
 Other countries: explicit maxspeed (+ motorway default), as before.
+
+Field signs (optional): with the environment variable SIGNS_EXPORT_KEY set, the signs
+collected by the app are downloaded from https://signs.mapszone.eu/api/signs/export.
+Trusted ones (set by hand, or seen >= 2 times and missed less often than seen) are
+matched to the nearest road (<= 25 m, same driving direction); their limit applies from
+the sign to the next junction / next sign / end of the road and wins over OSM and the
+rules. An end-of-limit sign (0) only stops the previous one.
 
 Usage:  python build_speedlimits.py romania-latest.osm.pbf RO osm_RO.bin [intravilan_dir]
 """
@@ -40,7 +48,7 @@ MIN_STEP_M = 30.0
 MOTORWAY_DEFAULT = {"DE": None, "PL": 140, "BG": 140}   # others: 130
 RURAL = {"DE": 100, "AT": 100, "CZ": 100, "SK": 100, "SI": 100, "HR": 100, "FR": 80, "ES": 80}
 
-F_INTRA, F_JUNCTION, F_DERIVED = 1, 2, 4
+F_INTRA, F_JUNCTION, F_DERIVED, F_SIGN = 1, 2, 4, 8
 
 # road classes whose crossings count as junctions
 JUNCTION_HW = {"trunk", "primary", "secondary", "tertiary", "unclassified", "residential",
@@ -218,6 +226,104 @@ def ro_inside(e):
     return 50
 
 
+# ---------------- field signs (signs.mapszone.eu) ----------------
+
+SIGN_MATCH_M = 25.0
+SIGN_CELL = 0.005          # grid for lookup, ~500 m
+
+
+class FieldSigns:
+    def __init__(self, signs):
+        self.grid = {}
+        for sg in signs:
+            k = (int(math.floor(sg["lat"] / SIGN_CELL)), int(math.floor(sg["lon"] / SIGN_CELL)))
+            self.grid.setdefault(k, []).append(sg)
+        self.count = len(signs)
+        self.used = 0
+
+    @staticmethod
+    def download():
+        key = os.environ.get("SIGNS_EXPORT_KEY", "").strip()
+        if not key:
+            print("field signs: SIGNS_EXPORT_KEY not set -> skipped", flush=True)
+            return None
+        import json
+        import urllib.request
+        url = os.environ.get("SIGNS_URL", "https://signs.mapszone.eu/api/signs/export")
+        try:
+            req = urllib.request.Request(url, headers={"X-Export-Key": key,
+                                                       "User-Agent": "OSM_RoadSpeedLimits-build/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except Exception as e:          # the map is still built, just without them
+            print(f"field signs: download failed ({e}) -> skipped", flush=True)
+            return None
+        ok = [sg for sg in data.get("signs", [])
+              if sg.get("manual") or (sg.get("hits", 0) >= 2 and sg.get("misses", 0) < sg.get("hits", 0))]
+        print(f"field signs: {len(data.get('signs', []))} downloaded, {len(ok)} trusted", flush=True)
+        return FieldSigns(ok) if ok else None
+
+    def near_box(self, la0, lo0, la1, lo1):
+        pad = 0.0005
+        out = []
+        for y in range(int(math.floor((la0 - pad) / SIGN_CELL)), int(math.floor((la1 + pad) / SIGN_CELL)) + 1):
+            for x in range(int(math.floor((lo0 - pad) / SIGN_CELL)), int(math.floor((lo1 + pad) / SIGN_CELL)) + 1):
+                out.extend(self.grid.get((y, x), ()))
+        return out
+
+
+class Line:
+    """A way in local metres: arc-length positions, projection, cutting."""
+    def __init__(self, pts):
+        self.pts = pts
+        la0, lo0 = pts[0]
+        self.kx = math.cos(math.radians(la0)) * 111320.0
+        self.ky = 110540.0
+        self.la0, self.lo0 = la0, lo0
+        self.xy = [((lo - lo0) * self.kx, (la - la0) * self.ky) for la, lo in pts]
+        self.cum = [0.0]
+        for i in range(1, len(self.xy)):
+            (x1, y1), (x2, y2) = self.xy[i - 1], self.xy[i]
+            self.cum.append(self.cum[-1] + math.hypot(x2 - x1, y2 - y1))
+        self.length = self.cum[-1]
+
+    def project(self, la, lo):
+        """-> (s along the line, distance m, bearing of the segment there)."""
+        px, py = (lo - self.lo0) * self.kx, (la - self.la0) * self.ky
+        best = (0.0, 1e18, 0.0)
+        for i in range(1, len(self.xy)):
+            (x1, y1), (x2, y2) = self.xy[i - 1], self.xy[i]
+            vx, vy = x2 - x1, y2 - y1
+            l2 = vx * vx + vy * vy
+            t = 0.0 if l2 == 0 else max(0.0, min(1.0, ((px - x1) * vx + (py - y1) * vy) / l2))
+            d = math.hypot(x1 + t * vx - px, y1 + t * vy - py)
+            if d < best[1]:
+                best = (self.cum[i - 1] + t * math.sqrt(l2), d, (math.degrees(math.atan2(vx, vy)) + 360) % 360)
+        return best
+
+    def point(self, s):
+        for i in range(1, len(self.cum)):
+            if s <= self.cum[i] or i == len(self.cum) - 1:
+                seg = self.cum[i] - self.cum[i - 1]
+                t = 0.0 if seg == 0 else max(0.0, min(1.0, (s - self.cum[i - 1]) / seg))
+                (a1, o1), (a2, o2) = self.pts[i - 1], self.pts[i]
+                return (a1 + t * (a2 - a1), o1 + t * (o2 - o1))
+        return self.pts[-1]
+
+    def cut(self, a, b):
+        out = [self.point(a)]
+        for i, c in enumerate(self.cum):
+            if a < c < b:
+                out.append(self.pts[i])
+        out.append(self.point(b))
+        return out
+
+
+def dir_diff(a, b):
+    d = abs(a - b) % 360
+    return 360 - d if d > 180 else d
+
+
 # ---------------- passes ----------------
 
 class DegreeHandler(osmium.SimpleHandler):
@@ -243,11 +349,11 @@ class DegreeHandler(osmium.SimpleHandler):
 
 
 class Handler(osmium.SimpleHandler):
-    def __init__(self, cc, out, junction_nodes, intra):
+    def __init__(self, cc, out, junction_nodes, intra, signs=None):
         super().__init__()
-        self.cc, self.out, self.jn, self.intra = cc, out, junction_nodes, intra
+        self.cc, self.out, self.jn, self.intra, self.signs = cc, out, junction_nodes, intra, signs
         self.ways = self.segs = self.junctions = self.motorway_defaults = 0
-        self.inside_segs = self.derived_segs = 0
+        self.inside_segs = self.derived_segs = self.sign_segs = 0
         self.done_j = set()
 
     def write(self, pts, fa, ba, flags):
@@ -267,6 +373,73 @@ class Handler(osmium.SimpleHandler):
                 self.inside_segs += 1
             if flags & F_DERIVED:
                 self.derived_segs += 1
+            if flags & F_SIGN:
+                self.sign_segs += 1
+
+    def finish(self, pts, refs, pieces, one_f, one_b):
+        """pieces: [(coords, fwd, bwd, flags)] in driving order. Applies field signs, writes."""
+        signs = []
+        if self.signs is not None:
+            la = [p[0] for p in pts]; lo = [p[1] for p in pts]
+            cand = self.signs.near_box(min(la), min(lo), max(la), max(lo))
+            if cand:
+                line = Line(pts)
+                for sg in cand:
+                    s_, d, brg = line.project(sg["lat"], sg["lon"])
+                    if d > SIGN_MATCH_M:
+                        continue
+                    dd = dir_diff(brg, sg["brg"])
+                    if dd < 45 and not one_b:
+                        signs.append((s_, "f", sg))
+                    elif dd > 135 and not one_f:
+                        signs.append((s_, "b", sg))
+        if not signs:
+            for c, fa, ba, fl in pieces:
+                self.write(c, fa, ba, fl)
+            return
+        self.signs.used += len(signs)
+        line = Line(pts)
+        L = line.length
+        # piece intervals on the original line
+        iv = []
+        for c, fa, ba, fl in pieces:
+            a = line.project(*c[0])[0]; b = line.project(*c[-1])[0]
+            iv.append((min(a, b), max(a, b), fa, ba, fl))
+        jpos = [line.cum[i] for i, r in enumerate(refs) if r in self.jn]
+        # one sign per place/direction: hand-set first, then the most seen
+        signs.sort(key=lambda x: (x[1], x[0]))
+        kept = []
+        for sg in signs:
+            if kept and kept[-1][1] == sg[1] and abs(kept[-1][0] - sg[0]) < 30:
+                o = kept[-1][2]
+                if (sg[2].get("manual"), sg[2].get("hits", 0)) > (o.get("manual"), o.get("hits", 0)):
+                    kept[-1] = sg
+                continue
+            kept.append(sg)
+        ovr = []      # (a, b, dir, value)
+        for s_, dr, sg in kept:
+            same = sorted(x[0] for x in kept if x[1] == dr)
+            if dr == "f":
+                ends = [p for p in jpos if p > s_ + 5] + [p for p in same if p > s_ + 1] + [L]
+                a, b = s_, min(ends)
+            else:
+                ends = [p for p in jpos if p < s_ - 5] + [p for p in same if p < s_ - 1] + [0.0]
+                a, b = max(ends), s_
+            if sg["limit"] > 0 and b - a > 1:
+                ovr.append((a, b, dr, int(sg["limit"])))
+        cuts = sorted({0.0, L} | {x for i in iv for x in i[:2]} | {x for o in ovr for x in o[:2]})
+        for a, b in zip(cuts, cuts[1:]):
+            if b - a < 0.5:
+                continue
+            m = (a + b) / 2
+            base = next((i for i in iv if i[0] - 0.01 <= m <= i[1] + 0.01), None)
+            fa, ba, fl = (base[2], base[3], base[4]) if base else (0, 0, 0)
+            for oa, ob, dr, v in ovr:
+                if oa <= m <= ob:
+                    if dr == "f": fa = min(v, 255)
+                    else: ba = min(v, 255)
+                    fl = (fl | F_SIGN) & ~F_DERIVED
+            self.write(line.cut(a, b), fa, ba, fl)
 
     def way(self, w):
         t = w.tags
@@ -302,7 +475,8 @@ class Handler(osmium.SimpleHandler):
             return min(f or 0, 255), min(b or 0, 255)
 
         if self.intra is not None and hw in RULE_HW:
-            self.way_ro(t, hw, pts, directions)
+            self.finish(pts, refs, self.way_ro(t, hw, pts, directions), one_f, one_b)
+            self.ways += 1
             return
 
         base = parse(t.get("maxspeed"), self.cc)
@@ -314,9 +488,11 @@ class Handler(osmium.SimpleHandler):
             if f:
                 self.motorway_defaults += 1; derived = F_DERIVED
         if f is None and b is None:
-            return
+            if self.signs is None or hw not in RULE_HW:
+                return
+            f = b = 0              # no limit known; a field sign may still give one
         fa, ba = directions(f, b)
-        self.write(pts, fa, ba, derived)
+        self.finish(pts, refs, [(pts, fa, ba, derived)], one_f, one_b)
         self.ways += 1
 
     def way_ro(self, t, hw, pts, directions):
@@ -331,10 +507,9 @@ class Handler(osmium.SimpleHandler):
         if fast:   # motorway / expressway: no intravilan rule
             f = e_f or default; b = e_b or default
             fa, ba = directions(f, b)
-            self.write(pts, fa, ba, 0 if (e_f or e_b) else F_DERIVED)
-            self.ways += 1
-            return
+            return [(pts, fa, ba, 0 if (e_f or e_b) else F_DERIVED)]
 
+        out = []
         pieces = self.intra.split([(lo, la) for la, lo in pts])
         for inside, c in pieces:
             p = [(la, lo) for lo, la in c]
@@ -342,13 +517,13 @@ class Handler(osmium.SimpleHandler):
                 f, b = ro_inside(e_f), ro_inside(e_b)
                 derived = 0 if (f == e_f and b == e_b) else F_DERIVED
                 fa, ba = directions(f, b)
-                self.write(p, fa, ba, F_INTRA | derived)
+                out.append((p, fa, ba, F_INTRA | derived))
             else:
                 f = e_f or default; b = e_b or default
                 derived = 0 if (e_f or e_b) else F_DERIVED
                 fa, ba = directions(f, b)
-                self.write(p, fa, ba, derived)
-        self.ways += 1
+                out.append((p, fa, ba, derived))
+        return out
 
 
 def main():
@@ -370,10 +545,10 @@ def main():
     print("pass 2: roads…", flush=True)
     with open(dst, "wb") as out:
         out.write(struct.pack(">i", 0x4F534C32))
-        h = Handler(cc, out, jn, intra)
+        h = Handler(cc, out, jn, intra, FieldSigns.download())
         h.apply_file(src, locations=True, idx="flex_mem")
     print(f"{cc}: {h.ways} roads, {h.segs} segments ({h.inside_segs} in intravilan, "
-          f"{h.derived_segs} rule-based), {h.junctions} junctions, "
+          f"{h.derived_segs} rule-based, {h.sign_segs} from field signs), {h.junctions} junctions, "
           f"{h.motorway_defaults} motorway defaults -> {dst}")
     if h.segs == 0:
         sys.exit("no segments — something is wrong")
