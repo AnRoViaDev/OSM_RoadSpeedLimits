@@ -35,14 +35,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install osmium
+      - run: pip install osmium shapely pyproj pyogrio numpy
       - name: Download ${{ matrix.cc }} from Geofabrik and convert
         run: |
           set -e
           mkdir -p out
           curl -fsSL --retry 3 -o src.osm.pbf "https://download.geofabrik.de/${{ matrix.path }}-latest.osm.pbf"
           ls -la src.osm.pbf
-          python scripts/build_speedlimits.py src.osm.pbf "${{ matrix.cc }}" "out/osm_${{ matrix.cc }}.bin"
+          EXTRA=""
+          if [ "${{ matrix.cc }}" = "RO" ] && ls limts/*.zip* >/dev/null 2>&1; then
+            mkdir -p intra
+            # split archive (Limite.zip.001, .002, ...) -> join, then extract
+            if ls limts/*.zip.001 >/dev/null 2>&1; then
+              for f in limts/*.zip.001; do cat "${f%.001}".[0-9][0-9][0-9] > "intra/$(basename "${f%.001}")"; done
+            fi
+            cp limts/*.zip intra/ 2>/dev/null || true
+            sudo apt-get install -y -qq p7zip-full >/dev/null
+            for z in intra/*.zip; do 7z x -y -ointra "$z" >/dev/null; done
+            find intra -name "*.gpkg" -o -name "*.shp" | head
+            EXTRA="intra"
+          fi
+          python scripts/build_speedlimits.py src.osm.pbf "${{ matrix.cc }}" "out/osm_${{ matrix.cc }}.bin" $EXTRA
       - uses: actions/upload-artifact@v4
         with:
           name: osm_${{ matrix.cc }}
