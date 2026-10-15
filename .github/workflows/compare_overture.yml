@@ -1,0 +1,27 @@
+name: Compare Overture vs our map (RO)
+
+on:
+  workflow_dispatch:           # "Run workflow" button only
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install duckdb
+      - name: Our current map (from the release)
+        run: curl -fsSL --retry 3 -o osm_RO.bin https://github.com/anrobiadev/OSM_RoadSpeedLimits/releases/latest/download/osm_RO.bin
+      - name: Download Overture (Romania) and compare
+        run: |
+          mkdir -p out
+          python scripts/compare_overture.py osm_RO.bin out/report.md out/diffs.csv
+          cat out/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overture_vs_osm_RO
+          path: out/
+          retention-days: 14
