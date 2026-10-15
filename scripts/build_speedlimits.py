@@ -151,15 +151,16 @@ class Intravilan:
             shapely.prepare(p)
 
     def split(self, coords):
-        """coords [(lon,lat)...] -> list of (inside: bool, [(lon,lat)...]) in driving order."""
+        """coords [(lon,lat)...] -> list of (inside: bool, [(lon,lat)...], polygon id | None)
+        in driving order."""
         sh = self.shapely
         line = sh.LineString(coords)
         idx = self.tree.query(line, predicate="intersects")
         if len(idx) == 0:
-            return [(False, coords)]
+            return [(False, coords, None)]
         for i in idx:
             if self.polys[i].contains(line):
-                return [(True, coords)]
+                return [(True, coords, int(i))]
         u = sh.union_all([self.polys[i] for i in idx])
         out = []
         for inside, g in ((True, line.intersection(u)), (False, line.difference(u))):
@@ -172,7 +173,14 @@ class Intravilan:
                     c.reverse(); s0 = s1
                 out.append((s0, inside, c))
         out.sort(key=lambda x: x[0])
-        return [(ins, c) for _, ins, c in out] or [(False, coords)]
+        res = []
+        for _, ins, c in out:
+            pid = None
+            if ins:                        # which settlement: the polygon holding the middle
+                mid = sh.LineString(c).interpolate(0.5, normalized=True)
+                pid = next((int(i) for i in idx if self.polys[i].covers(mid)), int(idx[0]))
+            res.append((ins, c, pid))
+        return res or [(False, coords, None)]
 
 
 def _tr(tr, xy):
@@ -195,7 +203,7 @@ def _lines(g):
 
 # ---------------- Romania rules ----------------
 
-def ro_category_default(t, hw):
+def ro_category_default(t, hw, is_e=False):
     """Limit outside built-up areas by road category, None = no limit."""
     ref = (t.get("ref") or "").upper().replace(" ", "")
     iref = (t.get("int_ref") or "").upper()
@@ -206,7 +214,7 @@ def ro_category_default(t, hw):
         return 130
     if ref.startswith("DEX") or t.get("motorroad") == "yes" or t.get("expressway") == "yes":
         return 120
-    if "E" in iref or re.search(r"(^|;)E\d", ref):
+    if is_e or "E" in iref or re.search(r"(^|;)E\d", ref):
         return 100
     if hw in ("trunk", "primary", "secondary", "tertiary", "unclassified", "road") or hw.endswith("_link") \
             or ref.startswith(("DN", "DJ", "DC")):
@@ -217,6 +225,51 @@ def ro_category_default(t, hw):
 def ro_is_fast(t, hw):
     ref = (t.get("ref") or "").upper().replace(" ", "")
     return hw in MOTORWAY_HW or ref.startswith(("A", "DEX")) or t.get("motorroad") == "yes"
+
+
+# A numbered road (E / DN / DJ / DC) crossing a built-up area for only a short stretch
+# (e.g. passing along the edge of a village) keeps its outside limit there: the 50 rule
+# applies only if the road runs at least this long inside THAT settlement.
+INTRA_MIN_M = float(os.environ.get("INTRA_MIN_M", "500"))
+
+
+def road_key(t, hw):
+    """Road number for the length rule, or None (streets etc. always follow the polygon)."""
+    if hw in ("residential", "living_street", "service", "track"):
+        return None
+    ref = (t.get("ref") or "").upper().replace(" ", "").split(";")[0]
+    return ref or None
+
+
+def line_len(c):
+    return sum(meters(c[i - 1][1], c[i - 1][0], c[i][1], c[i][0]) for i in range(1, len(c)))
+
+
+class IntraLengthHandler(osmium.SimpleHandler):
+    """Pass 1b: how long each numbered road runs inside each settlement polygon."""
+    def __init__(self, intra):
+        super().__init__()
+        self.intra = intra
+        self.total = {}
+
+    def way(self, w):
+        t = w.tags
+        hw = t.get("highway")
+        if hw not in RULE_HW or ro_is_fast(t, hw):
+            return
+        key = road_key(t, hw)
+        if not key:
+            return
+        try:
+            c = [(n.location.lon, n.location.lat) for n in w.nodes if n.location.valid()]
+        except osmium.InvalidLocationError:
+            return
+        if len(c) < 2:
+            return
+        for inside, part, pid in self.intra.split(c):
+            if inside:
+                k = (key, pid)
+                self.total[k] = self.total.get(k, 0.0) + line_len(part)
 
 
 def ro_inside(e):
@@ -332,9 +385,27 @@ class DegreeHandler(osmium.SimpleHandler):
         super().__init__()
         self.deg = {}
         self.motor = set()
+        self.e_rel = set()          # ways in a European route relation (network=e-road)
+        self.by_ref = {}            # ref -> [(way id, is_E, first node, last node)]
+
+    def relation(self, r):
+        t = r.tags
+        if t.get("route") != "road":
+            return
+        net = (t.get("network") or "").lower()
+        if net in ("e-road", "int") or re.match(r"^\s*E\s?\d", t.get("ref") or ""):
+            for m in r.members:
+                if m.type == "w":
+                    self.e_rel.add(m.ref)
 
     def way(self, w):
         hw = w.tags.get("highway")
+        ref = (w.tags.get("ref") or "").upper().replace(" ", "")
+        if ref and hw in RULE_HW and len(w.nodes) >= 2:
+            iref = (w.tags.get("int_ref") or "").upper()
+            is_e = "E" in iref or bool(re.search(r"(^|;)E\d", ref))
+            for one in ref.split(";"):
+                self.by_ref.setdefault(one, []).append((w.id, is_e, w.nodes[0].ref, w.nodes[-1].ref))
         if hw in MOTORWAY_HW:
             for n in w.nodes:
                 self.motor.add(n.ref)
@@ -348,9 +419,51 @@ class DegreeHandler(osmium.SimpleHandler):
             d[r] = d.get(r, 0) + (1 if i in (0, last) else 2)
 
 
+def european_ways(d):
+    """Ways that belong to a European road: int_ref E.., member of an E route relation,
+    or a stretch WITHOUT the tag that lies BETWEEN two European stretches of the same
+    road number (e.g. DN1 split in pieces where one piece misses int_ref)."""
+    e = set(d.e_rel)
+    filled = 0
+    for ref, ways in d.by_ref.items():
+        is_e = {wid for wid, ie, a, b in ways if ie or wid in d.e_rel}
+        if not is_e:
+            continue
+        e |= is_e
+        e_nodes = set()
+        for wid, ie, a, b in ways:
+            if wid in is_e:
+                e_nodes.add(a); e_nodes.add(b)
+        # union the non-E ways of this road number into connected stretches
+        rest = [(wid, a, b) for wid, ie, a, b in ways if wid not in is_e]
+        parent = {}
+        def find(x):
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]; x = parent[x]
+            return x
+        for wid, a, b in rest:
+            parent[find(a)] = find(b)
+        groups = {}
+        for wid, a, b in rest:
+            g = groups.setdefault(find(a), [set(), set()])
+            g[0].add(wid)
+            for n in (a, b):
+                if n in e_nodes:
+                    g[1].add(n)
+        for wids, touch in groups.values():
+            if len(touch) >= 2:            # E on both sides -> the gap is E too
+                e |= wids; filled += len(wids)
+    print(f"  European roads: {len(e)} ways ({filled} gap ways filled)", flush=True)
+    return e
+
+
 class Handler(osmium.SimpleHandler):
-    def __init__(self, cc, out, junction_nodes, intra, signs=None):
+    def __init__(self, cc, out, junction_nodes, intra, signs=None, e_ways=None):
         super().__init__()
+        self.e_ways = e_ways or set()
+        self.cur_way = 0
+        self.intra_len = {}
+        self.short_skipped = 0
         self.cc, self.out, self.jn, self.intra, self.signs = cc, out, junction_nodes, intra, signs
         self.ways = self.segs = self.junctions = self.motorway_defaults = 0
         self.inside_segs = self.derived_segs = self.sign_segs = 0
@@ -446,6 +559,7 @@ class Handler(osmium.SimpleHandler):
         hw = t.get("highway")
         if not hw:
             return
+        self.cur_way = w.id
         pts, refs = [], []
         try:
             for n in w.nodes:
@@ -501,7 +615,7 @@ class Handler(osmium.SimpleHandler):
         e_b = numeric(t.get("maxspeed:backward")) or numeric(ms)
         if hw == "living_street" or (ms or "").lower().endswith("living_street"):
             e_f = e_b = 20
-        default = ro_category_default(t, hw)
+        default = ro_category_default(t, hw, self.cur_way in self.e_ways)
         fast = ro_is_fast(t, hw)
 
         if fast:   # motorway / expressway: no intravilan rule
@@ -510,9 +624,13 @@ class Handler(osmium.SimpleHandler):
             return [(pts, fa, ba, 0 if (e_f or e_b) else F_DERIVED)]
 
         out = []
+        key = road_key(t, hw)
         pieces = self.intra.split([(lo, la) for la, lo in pts])
-        for inside, c in pieces:
+        for inside, c, pid in pieces:
             p = [(la, lo) for lo, la in c]
+            if inside and key and self.intra_len.get((key, pid), 0.0) < INTRA_MIN_M:
+                inside = False             # only clips the settlement -> outside limit
+                self.short_skipped += 1
             if inside:
                 f, b = ro_inside(e_f), ro_inside(e_b)
                 derived = 0 if (f == e_f and b == e_b) else F_DERIVED
@@ -539,17 +657,30 @@ def main():
     d = DegreeHandler()
     d.apply_file(src)
     jn = {r for r, k in d.deg.items() if k >= 3 and r not in d.motor}
+    e_ways = european_ways(d) if cc == "RO" else set()
     del d
     print(f"  {len(jn)} junctions", flush=True)
+
+    intra_len = {}
+    if intra is not None:
+        print(f"pass 1b: length of numbered roads inside each settlement (min {INTRA_MIN_M:.0f} m)…", flush=True)
+        il = IntraLengthHandler(intra)
+        il.apply_file(src, locations=True, idx="flex_mem")
+        intra_len = il.total
+        short = sum(1 for v in intra_len.values() if v < INTRA_MIN_M)
+        print(f"  {len(intra_len)} road/settlement crossings, {short} shorter than {INTRA_MIN_M:.0f} m", flush=True)
+        del il
 
     print("pass 2: roads…", flush=True)
     with open(dst, "wb") as out:
         out.write(struct.pack(">i", 0x4F534C32))
-        h = Handler(cc, out, jn, intra, FieldSigns.download())
+        h = Handler(cc, out, jn, intra, FieldSigns.download(), e_ways)
+        h.intra_len = intra_len
         h.apply_file(src, locations=True, idx="flex_mem")
     print(f"{cc}: {h.ways} roads, {h.segs} segments ({h.inside_segs} in intravilan, "
           f"{h.derived_segs} rule-based, {h.sign_segs} from field signs), {h.junctions} junctions, "
-          f"{h.motorway_defaults} motorway defaults -> {dst}")
+          f"{h.motorway_defaults} motorway defaults, {h.short_skipped} short settlement crossings "
+          f"kept at the outside limit -> {dst}")
     if h.segs == 0:
         sys.exit("no segments — something is wrong")
 
