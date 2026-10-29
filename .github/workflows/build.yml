@@ -45,7 +45,9 @@ jobs:
           curl -fsSL --retry 3 -o src.osm.pbf "https://download.geofabrik.de/${{ matrix.path }}-latest.osm.pbf"
           ls -la src.osm.pbf
           EXTRA=""
-          if [ "${{ matrix.cc }}" = "RO" ] && ls limts/*.zip* >/dev/null 2>&1; then
+          # intravilan polygons: OFF for now (pure OSM limits). To turn them back on, set the
+          # repository variable USE_INTRAVILAN = 1 (Settings -> Secrets and variables -> Actions -> Variables)
+          if [ "${{ vars.USE_INTRAVILAN }}" = "1" ] && [ "${{ matrix.cc }}" = "RO" ] && ls limts/*.zip* >/dev/null 2>&1; then
             mkdir -p intra
             # split archive (Limite.zip.001, .002, ...) -> join, then extract
             if ls limts/*.zip.001 >/dev/null 2>&1; then
